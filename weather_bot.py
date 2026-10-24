@@ -1,9 +1,9 @@
-
 import hashlib
 import json
 import os
 import random
 import urllib.request
+from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -107,6 +107,7 @@ def fetch(url, accept="*/*"):
             "Accept": accept,
         },
     )
+
     with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
         return response.read()
 
@@ -136,10 +137,12 @@ def load_state():
 def save_state(state):
     state["seen"] = state["seen"][-MAX_SEEN:]
     temporary = STATE_FILE.with_suffix(".tmp")
+
     temporary.write_text(
         json.dumps(state, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
     temporary.replace(STATE_FILE)
 
 
@@ -161,9 +164,18 @@ def post_discord(message):
         method="POST",
     )
 
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError(f"Discord returned HTTP {response.status}")
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+            if response.status not in (200, 204):
+                raise RuntimeError(
+                    f"Discord returned HTTP {response.status}"
+                )
+    except HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        # Show Discord's error details without printing the webhook URL.
+        raise RuntimeError(
+            f"Discord HTTP {exc.code}: {details[:1000]}"
+        ) from exc
 
 
 def make_id(source, value):
