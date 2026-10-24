@@ -491,8 +491,6 @@ def format_alert(alert):
 
     if details != NA:
         details = " ".join(details.split())
-        if len(details) > 600:
-            details = details[:597] + "..."
 
     return (
         f"🚨 **{available(alert.get('event'))}**\n"
