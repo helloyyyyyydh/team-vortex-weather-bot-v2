@@ -1,0 +1,475 @@
+
+import hashlib
+import json
+import os
+import random
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+STATE_FILE = Path("bot_state.json")
+TIMEOUT = 25
+MAX_SEEN = 3000
+UTC = timezone.utc
+NA = "Not Available"
+
+NWS_URL = "https://api.weather.gov/alerts/active"
+EUROPE_URL = (
+    "https://feeds.meteoalarm.org/"
+    "feeds/meteoalarm-legacy-atom-europe"
+)
+GDACS_URL = "https://www.gdacs.org/xml/rss.xml"
+
+USER_AGENT = "TeamVortexWeatherBot/3.2"
+
+FAKE_CITIES = [
+    "Cloudberry Bay, Exampleland",
+    "North Nimbus, Fictionia",
+    "Stormhaven, Imaginary Republic",
+    "Cumulus Crossing, Testoria",
+    "Thunderfield, Placeholder Islands",
+    "Rainy Ridge, Mockland",
+]
+
+FAKE_CATEGORIES = [
+    "Fictional Thunderstorm Warning",
+    "Imaginary Flood Watch",
+    "Simulated High Wind Advisory",
+    "Fictional Tornado Watch",
+    "Imaginary Coastal Flood Warning",
+    "Simulated Extreme Rainfall Alert",
+]
+
+
+def now_utc():
+    return datetime.now(UTC)
+
+
+def parse_time(value):
+    if not value:
+        return None
+
+    text = str(value).strip()
+
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            dt = parsedate_to_datetime(text)
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+
+    return dt
+
+
+def display_time(value):
+    """Display 12-hour time and a numeric UTC offset."""
+    dt = value if isinstance(value, datetime) else parse_time(value)
+
+    if dt is None:
+        return NA
+
+    offset = dt.strftime("%z")
+    if len(offset) == 5:
+        offset = offset[:3] + ":" + offset[3:]
+    elif not offset:
+        offset = NA
+
+    zone = " UTC" if dt.utcoffset() == timezone.utc.utcoffset(dt) else ""
+
+    return (
+        dt.strftime("%b %d, %Y at %I:%M:%S %p")
+        + zone
+        + f" ({offset})"
+    )
+
+
+def available(value):
+    """Return a clean value or Not Available for missing fields."""
+    if value is None:
+        return NA
+
+    value = str(value).strip()
+    return value if value else NA
+
+
+def fetch(url, accept="*/*"):
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": accept,
+        },
+    )
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        return response.read()
+
+
+def load_state():
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("State must be a JSON object.")
+    except FileNotFoundError:
+        state = {}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Cannot safely read {STATE_FILE}: {exc}"
+        ) from exc
+
+    state.setdefault("seen", [])
+    state.setdefault("last_hourly_test", "")
+    state.setdefault("baseline_saved", False)
+
+    if not isinstance(state["seen"], list):
+        raise RuntimeError("Invalid alert history in bot_state.json.")
+
+    return state
+
+
+def save_state(state):
+    state["seen"] = state["seen"][-MAX_SEEN:]
+    temporary = STATE_FILE.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temporary.replace(STATE_FILE)
+
+
+def post_discord(message):
+    if not WEBHOOK:
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL is missing from GitHub Actions secrets."
+        )
+
+    payload = json.dumps({
+        "content": message[:1900],
+        "allowed_mentions": {"parse": []},
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        WEBHOOK,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        if response.status not in (200, 204):
+            raise RuntimeError(f"Discord returned HTTP {response.status}")
+
+
+def make_id(source, value):
+    return hashlib.sha256(
+        f"{source}|{value}".encode("utf-8")
+    ).hexdigest()
+
+
+def child_text(element, names):
+    wanted = set(names)
+
+    for child in element.iter():
+        if child.tag.split("}")[-1] in wanted and child.text:
+            value = child.text.strip()
+            if value:
+                return value
+
+    return ""
+
+
+def get_nws_alerts():
+    data = json.loads(fetch(
+        NWS_URL,
+        "application/geo+json, application/json",
+    ).decode("utf-8"))
+
+    alerts = []
+
+    for feature in data.get("features", []):
+        p = feature.get("properties") or {}
+        source_id = (
+            feature.get("id")
+            or p.get("id")
+            or json.dumps(p, sort_keys=True)
+        )
+
+        alerts.append({
+            "id": make_id("NWS", source_id),
+            "source": "U.S. National Weather Service",
+            "event": available(p.get("event")),
+            "headline": available(p.get("headline")),
+            "description": available(p.get("description")),
+            "area": available(p.get("areaDesc")),
+            "severity": available(p.get("severity")),
+            "urgency": available(p.get("urgency")),
+            "certainty": available(p.get("certainty")),
+            "start": p.get("onset") or p.get("effective"),
+            "end": p.get("ends") or p.get("expires"),
+            "url": available(feature.get("id")),
+            "kind": "weather",
+        })
+
+    return alerts
+
+
+def get_europe_alerts():
+    root = ET.fromstring(fetch(EUROPE_URL))
+    alerts = []
+    current = now_utc()
+
+    for entry in root.iter():
+        if entry.tag.split("}")[-1] != "entry":
+            continue
+
+        title = child_text(entry, ["title"])
+        entry_id = child_text(entry, ["id"]) or title
+        summary = child_text(entry, ["summary", "content"])
+        onset = child_text(entry, ["onset", "effective"])
+        expires = child_text(entry, ["expires", "expiry"])
+        area = child_text(entry, ["areaDesc", "area"])
+
+        link = ""
+        for child in entry:
+            if child.tag.split("}")[-1] == "link":
+                href = child.attrib.get("href", "")
+                if href and child.attrib.get(
+                    "rel", "alternate"
+                ) in ("alternate", ""):
+                    link = href
+                    break
+
+        expiry_dt = parse_time(expires)
+        if expiry_dt is not None and expiry_dt < current:
+            continue
+
+        alerts.append({
+            "id": make_id("MeteoAlarm", entry_id or title),
+            "source": "MeteoAlarm Europe",
+            "event": available(title),
+            "headline": available(summary),
+            "description": available(summary),
+            "area": available(area),
+            "severity": available(
+                child_text(entry, ["severity", "awareness_level"])
+            ),
+            "urgency": available(child_text(entry, ["urgency"])),
+            "certainty": available(child_text(entry, ["certainty"])),
+            "start": onset or child_text(entry, ["updated", "published"]),
+            "end": expires,
+            "url": available(link) if link else NA,
+            "kind": "weather",
+        })
+
+    return alerts
+
+
+def get_gdacs_events():
+    root = ET.fromstring(fetch(GDACS_URL))
+    events = []
+
+    for item in root.iter():
+        if item.tag.split("}")[-1] != "item":
+            continue
+
+        title = child_text(item, ["title"])
+        link = child_text(item, ["link"])
+        description = child_text(item, ["description"])
+        published = child_text(item, ["pubDate"])
+        guid = child_text(item, ["guid"]) or link or title
+
+        events.append({
+            "id": make_id("GDACS", guid),
+            "source": "GDACS global disaster monitoring",
+            "event": available(title),
+            "headline": available(description),
+            "description": available(description),
+            "area": NA,
+            "severity": NA,
+            "urgency": NA,
+            "certainty": NA,
+            "start": published,
+            "end": None,
+            "url": available(link) if link else NA,
+            "kind": "disaster",
+        })
+
+    return events
+
+
+def format_alert(alert):
+    details = available(
+        alert.get("headline")
+        if alert.get("headline") != NA
+        else alert.get("description")
+    )
+
+    if details != NA:
+        details = " ".join(details.split())
+        if len(details) > 600:
+            details = details[:597] + "..."
+
+    kind = (
+        "Global disaster event"
+        if alert["kind"] == "disaster"
+        else "Weather warning / watch / advisory"
+    )
+
+    return (
+        f"🚨 **{available(alert.get('event'))}**\n"
+        f"**Type:** {kind}\n"
+        f"**Source:** {available(alert.get('source'))}\n"
+        f"**Location:** {available(alert.get('area'))}\n"
+        f"**Severity:** {available(alert.get('severity'))}\n"
+        f"**Urgency:** {available(alert.get('urgency'))}\n"
+        f"**Certainty:** {available(alert.get('certainty'))}\n"
+        f"**Start / issued:** {display_time(alert.get('start'))}\n"
+        f"**End / expires:** {display_time(alert.get('end'))}\n"
+        f"**Details:** {details}\n"
+        f"**Track it:** {available(alert.get('url'))}\n"
+        f"**Bot check time:** {display_time(now_utc())}"
+    )
+
+
+def send_hourly_fake_test(state):
+    now = now_utc()
+    hour_key = now.strftime("%Y-%m-%d-%H")
+
+    if state.get("last_hourly_test") == hour_key:
+        return
+
+    fake_end = now.replace(minute=59, second=59, microsecond=0)
+
+    message = (
+        "🧪 **FAKE TEST EMERGENCY — NOT REAL — DO NOT ACT ON THIS**\n"
+        f"**Fictional category:** {random.choice(FAKE_CATEGORIES)}\n"
+        f"**Fictional location:** {random.choice(FAKE_CITIES)}\n"
+        f"**Fake start:** {display_time(now)}\n"
+        f"**Fake end:** {display_time(fake_end)}\n"
+        "This is a randomized bot test, not an official alert or real emergency.\n"
+        f"**Official tracking link:** {NA} (fictional event)\n"
+        f"**Test sent:** {display_time(now)}"
+    )
+
+    post_discord(message)
+    state["last_hourly_test"] = hour_key
+
+
+def main():
+    if not WEBHOOK:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is not configured.")
+
+    state = load_state()
+    now = now_utc()
+
+    # Only announce a startup for a manual workflow run.
+    # Scheduled five-minute checks do not post startup messages.
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        post_discord(
+            "🟢 **Team Vortex Weather Bot has been manually started!**\n"
+            f"**Time:** {display_time(now)}"
+        )
+
+    successful_weather_feeds = []
+    failed_feeds = []
+    active_weather = []
+    disaster_events = []
+
+    for name, getter, category in [
+        ("U.S. NWS", get_nws_alerts, "weather"),
+        ("MeteoAlarm Europe", get_europe_alerts, "weather"),
+        ("GDACS global disasters", get_gdacs_events, "disaster"),
+    ]:
+        try:
+            items = getter()
+
+            if category == "weather":
+                successful_weather_feeds.append(name)
+                active_weather.extend(items)
+            else:
+                disaster_events.extend(items)
+
+        except Exception as exc:
+            failed_feeds.append(
+                f"{name}: {type(exc).__name__}: {str(exc)[:180]}"
+            )
+
+    seen = set(state["seen"])
+    all_items = active_weather + disaster_events
+    new_items = [item for item in all_items if item["id"] not in seen]
+
+    if not state["baseline_saved"]:
+        state["seen"] = list(dict.fromkeys(
+            item["id"] for item in all_items
+        ))[-MAX_SEEN:]
+        state["baseline_saved"] = True
+
+        post_discord(
+            "🧭 **Initial alert history created.**\n"
+            "Existing feed entries were recorded to reduce duplicate spam. "
+            "Newly detected entries will be posted on later checks.\n"
+            f"**Weather feeds working:** "
+            f"{', '.join(successful_weather_feeds) or NA}\n"
+            f"**Time:** {display_time(now_utc())}"
+        )
+    else:
+        for item in new_items:
+            post_discord(format_alert(item))
+            state["seen"].append(item["id"])
+
+    if len(successful_weather_feeds) == 2:
+        if active_weather:
+            post_discord(
+                "📋 **Active weather alerts listed in monitored feeds**\n"
+                f"**Count:** {len(active_weather)}\n"
+                f"**Sources checked:** {', '.join(successful_weather_feeds)}\n"
+                "Previously seen alerts are not repeated as new alerts.\n"
+                f"**Checked:** {display_time(now_utc())}"
+            )
+        else:
+            post_discord(
+                "✅ **No active weather alerts were listed in the monitored "
+                "feeds at this check.**\n"
+                f"**Sources checked:** {', '.join(successful_weather_feeds)}\n"
+                "This does not guarantee that no alerts exist worldwide.\n"
+                f"**Checked:** {display_time(now_utc())}"
+            )
+    else:
+        post_discord(
+            "⚠️ **Active-alert status could not be fully confirmed.**\n"
+            f"**Weather feeds that worked:** "
+            f"{', '.join(successful_weather_feeds) or NA}\n"
+            "At least one monitored weather feed failed. A global all-clear "
+            "message would be unreliable.\n"
+            f"**Checked:** {display_time(now_utc())}"
+        )
+
+    if failed_feeds:
+        post_discord(
+            "⚠️ **Some sources could not be checked:**\n"
+            + "\n".join(f"• {failure}" for failure in failed_feeds)
+            + f"\n**Time:** {display_time(now_utc())}"
+        )
+
+    try:
+        send_hourly_fake_test(state)
+    except Exception as exc:
+        print(f"Hourly fake test could not be sent: {exc}")
+
+    save_state(state)
+
+    print(f"Check finished: {now.isoformat()}")
+    print(f"Weather feeds working: {successful_weather_feeds}")
+    print(f"Failed feeds: {failed_feeds}")
+    print(f"Weather alerts listed: {len(active_weather)}")
+    print(f"Global disaster events listed: {len(disaster_events)}")
+
+
+if __name__ == "__main__":
+    main()
