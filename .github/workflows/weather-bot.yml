@@ -1,0 +1,53 @@
+
+name: Team Vortex Weather Bot
+
+on:
+  schedule:
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: team-vortex-weather-bot
+  cancel-in-progress: false
+
+jobs:
+  weather-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: python -m py_compile weather_bot.py
+
+      - name: Run weather bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python weather_bot.py
+
+      - name: Save alert history
+        if: success()
+        run: |
+          if [ -f bot_state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add bot_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update weather bot alert history [skip ci]"
+              git push
+            else
+              echo "Alert history has not changed."
+            fi
+          fi
