@@ -178,49 +178,78 @@ def post_discord(message):
             "DISCORD_WEBHOOK_URL is missing from GitHub Actions secrets."
         )
 
-    payload = json.dumps({
-        "content": message[:1900],
-        "allowed_mentions": {"parse": []},
-    }).encode("utf-8")
+    # Split long grouped-alert summaries into complete Discord messages
+    # instead of silently cutting off hazards at the 2,000-character limit.
+    chunks = []
+    current = ""
+    for line in str(message).splitlines() or [""]:
+        while len(line) > 1800:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:1800])
+            line = line[1800:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > 1800:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current or not chunks:
+        chunks.append(current)
 
-    # Discord may briefly rate-limit a webhook when several alerts arrive
-    # together. Respect retry_after and retry instead of failing the whole run.
-    for attempt in range(5):
-        request = urllib.request.Request(
-            WEBHOOK,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "DiscordBot (https://github.com, 1.0)",
-            },
-            method="POST",
-        )
+    for chunk in chunks:
+        payload = json.dumps({
+            "content": chunk,
+            "allowed_mentions": {"parse": []},
+        }).encode("utf-8")
 
-        try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                if response.status not in (200, 204):
-                    raise RuntimeError(
-                        f"Discord returned HTTP {response.status}"
-                    )
-                return
-        except HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
+        # Respect Discord rate limits and retry transient server/network errors.
+        delivered = False
+        for attempt in range(5):
+            request = urllib.request.Request(
+                WEBHOOK,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "TeamVortexWeatherBot/3.2",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                    if response.status not in (200, 204):
+                        raise RuntimeError(
+                            f"Discord returned HTTP {response.status}"
+                        )
+                    delivered = True
+                    break
+            except HTTPError as exc:
+                details = exc.read().decode("utf-8", errors="replace")
+                if exc.code == 429 and attempt < 4:
+                    try:
+                        error_data = json.loads(details)
+                        delay = float(error_data.get("retry_after", 1))
+                    except (ValueError, TypeError, AttributeError):
+                        delay = 1.0
+                    time.sleep(max(0.5, min(delay, 30.0)))
+                    continue
+                if 500 <= exc.code <= 599 and attempt < 4:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                raise RuntimeError(
+                    f"Discord HTTP {exc.code}: {details[:500]}"
+                ) from exc
+            except (TimeoutError, OSError) as exc:
+                if attempt < 4:
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
+                raise RuntimeError(
+                    f"Discord delivery failed after retries: {type(exc).__name__}"
+                ) from exc
 
-            if exc.code == 429 and attempt < 4:
-                try:
-                    error_data = json.loads(details)
-                    delay = float(error_data.get("retry_after", 1))
-                except (ValueError, TypeError, AttributeError):
-                    delay = 1.0
-                time.sleep(max(0.5, min(delay, 30.0)))
-                continue
-
-            # Never print the webhook URL or other secret data.
-            raise RuntimeError(
-                f"Discord HTTP {exc.code}: {details[:1000]}"
-            ) from exc
-
-    raise RuntimeError("Discord remained rate-limited after 5 attempts.")
+        if not delivered:
+            raise RuntimeError("Discord message was not delivered after retries.")
 
 def make_id(source, value):
     return hashlib.sha256(
