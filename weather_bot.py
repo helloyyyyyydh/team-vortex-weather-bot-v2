@@ -269,6 +269,56 @@ def child_text(element, names):
     return ""
 
 
+def geometry_center(geometry):
+    """Return a best-effort point inside/near an NWS alert geometry."""
+    if not isinstance(geometry, dict):
+        return None
+
+    points = []
+
+    def collect(value):
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) >= 2
+            and isinstance(value[0], (int, float))
+            and isinstance(value[1], (int, float))
+        ):
+            points.append((float(value[0]), float(value[1])))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                collect(child)
+
+    collect(geometry.get("coordinates"))
+    if not points:
+        return None
+
+    # GeoJSON positions are [longitude, latitude]. Average all vertices
+    # to get a useful map-click point; this is a locator, not a hazard boundary.
+    longitude = sum(point[0] for point in points) / len(points)
+    latitude = sum(point[1] for point in points) / len(points)
+    if not (-180 <= longitude <= 180 and -90 <= latitude <= 90):
+        return None
+    return latitude, longitude
+
+
+def readable_nws_url(feature):
+    """Build an official, human-readable NWS page for the alert's area.
+
+    NWS retired its old HTML alert-detail pages in December 2025. The
+    canonical per-alert URL is now the API JSON resource, so use the NWS
+    forecast page at a point in the alert geometry for browser-friendly
+    context instead of linking every alert to the same generic page.
+    """
+    center = geometry_center(feature.get("geometry"))
+    if center is None:
+        return "https://www.weather.gov/"
+    latitude, longitude = center
+    return (
+        "https://forecast.weather.gov/MapClick.php"
+        f"?lat={latitude:.4f}&lon={longitude:.4f}"
+    )
+
+
 def get_nws_alerts():
     data = json.loads(fetch(
         NWS_URL,
@@ -316,9 +366,10 @@ def get_nws_alerts():
             "certainty": available(p.get("certainty")),
             "start": p.get("onset") or p.get("effective"),
             "end": p.get("ends") or p.get("expires"),
-            # API links return JSON; provide a readable NWS website too.
+            # The exact official alert resource is JSON; the readable link opens
+            # the NWS forecast page at a point within the alert geometry.
             "url": available(feature.get("id")),
-            "human_url": "https://www.weather.gov/alerts",
+            "human_url": readable_nws_url(feature),
             "kind": "weather",
         })
 
@@ -504,7 +555,7 @@ def format_alert(alert):
         f"**Details:** {details}\n"
         f"**Official alert data (JSON):** {available(alert.get('url'))}\n"
         + (
-            f"**Readable NWS site:** {available(alert.get('human_url'))}\n"
+            f"**Readable NWS page for affected area:** {available(alert.get('human_url'))}\n"
             if alert.get("source") == "U.S. National Weather Service"
             else ""
         )
