@@ -468,12 +468,16 @@ def main():
             f"**Time:** {display_time(now_utc())}"
         )
     else:
-        # Post only newly discovered entries, with a hard cap to prevent
-        # feed backlogs from flooding Discord.
-        selected = [item for item in all_items if item["id"] not in seen][:10]
+        # A manual run doubles as a current-alert listing: show up to ten
+        # active entries even if they were already recorded in history.
+        # Scheduled checks only post newly discovered entries.
+        if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+            selected = all_items[:10]
+        else:
+            selected = [item for item in all_items if item["id"] not in seen][:10]
 
         # Mark all discovered entries seen, including entries beyond the cap,
-        # so a large feed backlog never floods later checks.
+        # so a large feed backlog never floods Discord.
         for item in all_items:
             if item["id"] not in seen:
                 state["seen"].append(item["id"])
