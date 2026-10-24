@@ -422,7 +422,7 @@ def get_nws_alerts():
             # the NWS forecast page at a point within the alert geometry.
             "url": available(feature.get("id")),
             "human_url": readable_nws_url(feature),
-            "satellite_image": satellite_image(feature),
+            "geometry": feature.get("geometry"),
             "kind": "weather",
         })
 
@@ -712,7 +712,8 @@ def main():
         # This prevents the ten-message cap from permanently swallowing the
         # rest of a large backlog. Manual runs still list current active alerts.
         for item in selected:
-            post_discord(format_alert(item), image_bytes=item.get("satellite_image"))
+            image_bytes = satellite_image(item) if "U.S. National Weather Service" in available(item.get("source")) else None
+            post_discord(format_alert(item), image_bytes=image_bytes)
             for alert_id in item.get("_ids", [item["id"]]):
                 if alert_id not in seen:
                     state["seen"].append(alert_id)
