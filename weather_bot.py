@@ -172,7 +172,7 @@ def save_state(state):
     temporary.replace(STATE_FILE)
 
 
-def post_discord(message):
+def post_discord(message, image_bytes=None):
     if not WEBHOOK:
         raise RuntimeError(
             "DISCORD_WEBHOOK_URL is missing from GitHub Actions secrets."
@@ -198,20 +198,33 @@ def post_discord(message):
     if current or not chunks:
         chunks.append(current)
 
-    for chunk in chunks:
-        payload = json.dumps({
+    for chunk_index, chunk in enumerate(chunks):
+        payload = {
             "content": chunk,
             "allowed_mentions": {"parse": []},
-        }).encode("utf-8")
+        }
+        if image_bytes is not None and chunk_index == 0:
+            boundary = "----TeamVortexWeatherBotBoundary"
+            body = b"".join([
+                f"--{boundary}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n".encode(),
+                json.dumps(payload).encode("utf-8"),
+                f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"alert-satellite.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".encode(),
+                image_bytes,
+                f"\r\n--{boundary}--\r\n".encode(),
+            ])
+            content_type = f"multipart/form-data; boundary={boundary}"
+        else:
+            body = json.dumps(payload).encode("utf-8")
+            content_type = "application/json"
 
         # Respect Discord rate limits and retry transient server/network errors.
         delivered = False
         for attempt in range(5):
             request = urllib.request.Request(
                 WEBHOOK,
-                data=payload,
+                data=body,
                 headers={
-                    "Content-Type": "application/json",
+                    "Content-Type": content_type,
                     "User-Agent": "TeamVortexWeatherBot/3.2",
                 },
                 method="POST",
@@ -699,7 +712,7 @@ def main():
         # This prevents the ten-message cap from permanently swallowing the
         # rest of a large backlog. Manual runs still list current active alerts.
         for item in selected:
-            post_discord(format_alert(item))
+            post_discord(format_alert(item), image_bytes=item.get("satellite_image"))
             for alert_id in item.get("_ids", [item["id"]]):
                 if alert_id not in seen:
                     state["seen"].append(alert_id)
