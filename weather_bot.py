@@ -113,9 +113,29 @@ def fetch(url, accept="*/*"):
             "Accept": accept,
         },
     )
-
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-        return response.read()
+    last_error = None
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                return response.read()
+        except HTTPError as exc:
+            # Retrying rate limits and transient server errors is useful;
+            # permanent client errors should fail immediately.
+            if exc.code != 429 and not 500 <= exc.code <= 599:
+                raise
+            last_error = exc
+            retry_after = exc.headers.get("Retry-After", "")
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = 1.5 * (attempt + 1)
+            if attempt < 2:
+                time.sleep(max(0.5, min(delay, 10.0)))
+        except (TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"Fetch failed after retries for {url}: {type(last_error).__name__}") from last_error
 
 
 def load_state():
@@ -269,7 +289,7 @@ def get_nws_alerts():
             "end": p.get("ends") or p.get("expires"),
             # API links return JSON; provide a readable NWS website too.
             "url": available(feature.get("id")),
-            "human_url": "https://www.weather.gov/",
+            "human_url": "https://www.weather.gov/alerts",
             "kind": "weather",
         })
 
@@ -390,20 +410,30 @@ def combine_same_locations(items):
             grouped[key] = dict(item)
             grouped[key]["_events"] = [available(item.get("event"))]
             grouped[key]["_details"] = []
+            grouped[key]["_ids"] = [item["id"]]
             detail = item.get("headline") or item.get("description")
-            if detail and detail != NA:
-                grouped[key]["_details"].append(" ".join(detail.split()))
+            detail = " ".join(detail.split()) if detail and detail != NA else NA
+            grouped[key]["_details"].append(
+                f"{available(item.get('event'))} | Severity: {available(item.get('severity'))} | "
+                f"Urgency: {available(item.get('urgency'))} | Certainty: {available(item.get('certainty'))} | "
+                f"{detail}"
+            )
             grouped[key]["_sources"] = [available(item.get("source"))]
         else:
             current = grouped[key]
+            current["_ids"].append(item["id"])
             event = available(item.get("event"))
             if event not in current["_events"]:
                 current["_events"].append(event)
             detail = item.get("headline") or item.get("description")
-            if detail and detail != NA:
-                detail = " ".join(detail.split())
-                if detail not in current["_details"]:
-                    current["_details"].append(detail)
+            detail = " ".join(detail.split()) if detail and detail != NA else NA
+            hazard_detail = (
+                f"{event} | Severity: {available(item.get('severity'))} | "
+                f"Urgency: {available(item.get('urgency'))} | Certainty: {available(item.get('certainty'))} | "
+                f"{detail}"
+            )
+            if hazard_detail not in current["_details"]:
+                current["_details"].append(hazard_detail)
             source = available(item.get("source"))
             if source not in current["_sources"]:
                 current["_sources"].append(source)
@@ -414,6 +444,7 @@ def combine_same_locations(items):
         item["headline"] = " | ".join(item.pop("_details")) or NA
         item["description"] = item["headline"]
         item["source"] = " / ".join(item.pop("_sources"))
+        item["_ids"] = list(dict.fromkeys(item.pop("_ids")))
         if " / " in item["event"]:
             item["severity"] = "Multiple alerts"
             item["urgency"] = "See details"
@@ -546,17 +577,17 @@ def main():
         # location into one summary rather than hiding them or repeating it.
         selected = combine_same_locations(selected)[:10]
 
-        # Mark all discovered entries seen, including entries beyond the cap,
-        # so a large feed backlog never floods Discord.
-        for item in all_items:
-            if item["id"] not in seen:
-                state["seen"].append(item["id"])
-                seen.add(item["id"])
-        state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN:]
-        save_state(state)
-
+        # Only mark entries seen after their grouped Discord post succeeds.
+        # This prevents the ten-message cap from permanently swallowing the
+        # rest of a large backlog. Manual runs still list current active alerts.
         for item in selected:
             post_discord(format_alert(item))
+            for alert_id in item.get("_ids", [item["id"]]):
+                if alert_id not in seen:
+                    state["seen"].append(alert_id)
+                    seen.add(alert_id)
+            state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN:]
+            save_state(state)
 
     # Keep status summaries to one concise message per check.
     if len(successful_weather_feeds) == 2:
