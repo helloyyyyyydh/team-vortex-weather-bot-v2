@@ -314,14 +314,31 @@ def geometry_center(geometry):
     return latitude, longitude
 
 
-def readable_nws_url(feature):
-    """Build an official, human-readable NWS page for the alert's area.
+def geometry_from_affected_zones(feature, properties):
+    """Use official NWS forecast-zone polygons when an alert has no geometry."""
+    zone_urls = properties.get("affectedZones") or []
+    zone_geometries = []
+    for zone_url in zone_urls[:12]:
+        try:
+            zone_data = json.loads(fetch(zone_url, "application/geo+json, application/json").decode("utf-8"))
+            geometry = zone_data.get("geometry")
+            if geometry and geometry.get("coordinates"):
+                zone_geometries.append(geometry)
+        except Exception as exc:
+            print(f"Could not fetch NWS affected zone: {type(exc).__name__}")
+    if not zone_geometries:
+        return None
+    # The geometry helpers recursively inspect coordinates, so a collection
+    # preserves all fetched zone polygons for a representative map location.
+    return {
+        "type": "GeometryCollection",
+        "geometries": zone_geometries,
+        "coordinates": [geometry.get("coordinates", []) for geometry in zone_geometries],
+    }
 
-    NWS retired its old HTML alert-detail pages in December 2025. The
-    canonical per-alert URL is now the API JSON resource, so use the NWS
-    forecast page at a point in the alert geometry for browser-friendly
-    context instead of linking every alert to the same generic page.
-    """
+
+def readable_nws_url(feature):
+    """Build a human-readable NWS map link from alert or affected-zone geometry."""
     center = geometry_center(feature.get("geometry"))
     if center is None:
         return "https://www.weather.gov/"
@@ -406,6 +423,10 @@ def get_nws_alerts():
             or json.dumps(p, sort_keys=True)
         )
 
+        geometry = feature.get("geometry")
+        if not geometry or not geometry.get("coordinates"):
+            geometry = geometry_from_affected_zones(feature, p)
+
         alerts.append({
             "id": make_id("NWS", source_id),
             "source": "U.S. National Weather Service",
@@ -421,8 +442,8 @@ def get_nws_alerts():
             # The exact official alert resource is JSON; the readable link opens
             # the NWS forecast page at a point within the alert geometry.
             "url": available(feature.get("id")),
-            "human_url": readable_nws_url(feature),
-            "geometry": feature.get("geometry"),
+            "human_url": readable_nws_url({"geometry": geometry}),
+            "geometry": geometry,
             "kind": "weather",
         })
 
