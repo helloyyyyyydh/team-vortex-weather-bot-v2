@@ -75,12 +75,16 @@ def parse_time(value):
     return dt
 
 
-def display_time(value):
-    """Display 12-hour time and a numeric UTC offset."""
+def display_time(value, include_timezone=True):
+    """Display 12-hour time, optionally including its timezone."""
     dt = value if isinstance(value, datetime) else parse_time(value)
 
     if dt is None:
         return NA
+
+    result = dt.strftime("%b %d, %Y at %I:%M:%S %p")
+    if not include_timezone:
+        return result
 
     offset = dt.strftime("%z")
     if len(offset) == 5:
@@ -89,12 +93,7 @@ def display_time(value):
         offset = NA
 
     zone = " UTC" if dt.utcoffset() == timezone.utc.utcoffset(dt) else ""
-
-    return (
-        dt.strftime("%b %d, %Y at %I:%M:%S %p")
-        + zone
-        + f" ({offset})"
-    )
+    return result + zone + f" ({offset})"
 
 
 def available(value):
@@ -381,6 +380,48 @@ def get_gdacs_events():
     return events
 
 
+def combine_same_locations(items):
+    """Group feed entries by location without silently dropping hazards."""
+    grouped = {}
+    for item in items:
+        area = " ".join(available(item.get("area")).casefold().split())
+        key = area if area != NA.casefold() else f"unknown:{item['id']}"
+        if key not in grouped:
+            grouped[key] = dict(item)
+            grouped[key]["_events"] = [available(item.get("event"))]
+            grouped[key]["_details"] = []
+            detail = item.get("headline") or item.get("description")
+            if detail and detail != NA:
+                grouped[key]["_details"].append(" ".join(detail.split()))
+            grouped[key]["_sources"] = [available(item.get("source"))]
+        else:
+            current = grouped[key]
+            event = available(item.get("event"))
+            if event not in current["_events"]:
+                current["_events"].append(event)
+            detail = item.get("headline") or item.get("description")
+            if detail and detail != NA:
+                detail = " ".join(detail.split())
+                if detail not in current["_details"]:
+                    current["_details"].append(detail)
+            source = available(item.get("source"))
+            if source not in current["_sources"]:
+                current["_sources"].append(source)
+
+    result = []
+    for item in grouped.values():
+        item["event"] = " / ".join(item.pop("_events"))
+        item["headline"] = " | ".join(item.pop("_details")) or NA
+        item["description"] = item["headline"]
+        item["source"] = " / ".join(item.pop("_sources"))
+        if " / " in item["event"]:
+            item["severity"] = "Multiple alerts"
+            item["urgency"] = "See details"
+            item["certainty"] = "See details"
+        result.append(item)
+    return result
+
+
 def format_alert(alert):
     details = available(
         alert.get("headline")
@@ -409,7 +450,7 @@ def format_alert(alert):
             if alert.get("source") == "U.S. National Weather Service"
             else ""
         )
-        + f"**Bot check time:** {display_time(now_utc())}"
+        + f"**Bot check time:** {display_time(now_utc(), include_timezone=False)}"
     )
 
 
@@ -448,7 +489,7 @@ def main():
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
         post_discord(
             "🟢 **Team Vortex Weather Bot has been manually started!**\n"
-            f"**Time:** {display_time(now)}"
+            f"**Time:** {display_time(now, include_timezone=False)}"
         )
 
     successful_weather_feeds = []
@@ -491,16 +532,19 @@ def main():
             "on later checks.\n"
             f"**Weather feeds working:** "
             f"{', '.join(successful_weather_feeds) or NA}\n"
-            f"**Time:** {display_time(now_utc())}"
+            f"**Time:** {display_time(now_utc(), include_timezone=False)}"
         )
     else:
         # A manual run doubles as a current-alert listing: show up to ten
         # active entries even if they were already recorded in history.
         # Scheduled checks only post newly discovered entries.
         if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
-            selected = all_items[:10]
+            selected = all_items
         else:
-            selected = [item for item in all_items if item["id"] not in seen][:10]
+            selected = [item for item in all_items if item["id"] not in seen]
+        # One Discord post per location; combine distinct hazards at that
+        # location into one summary rather than hiding them or repeating it.
+        selected = combine_same_locations(selected)[:10]
 
         # Mark all discovered entries seen, including entries beyond the cap,
         # so a large feed backlog never floods Discord.
@@ -540,7 +584,7 @@ def main():
 
     if failed_feeds:
         status += "\n**Sources with errors:** " + "; ".join(failed_feeds[:3])
-    status += f"\n**Checked:** {display_time(now_utc())}"
+    status += f"\n**Checked:** {display_time(now_utc(), include_timezone=False)}"
     post_discord(status)
 
     try:
