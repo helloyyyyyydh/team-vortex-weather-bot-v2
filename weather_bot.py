@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import random
+import time
 import urllib.request
 from urllib.error import HTTPError
 import xml.etree.ElementTree as ET
@@ -163,29 +164,44 @@ def post_discord(message):
         "allowed_mentions": {"parse": []},
     }).encode("utf-8")
 
-    request = urllib.request.Request(
-        WEBHOOK,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://github.com, 1.0)",
-        },
-        method="POST",
-    )
+    # Discord may briefly rate-limit a webhook when several alerts arrive
+    # together. Respect retry_after and retry instead of failing the whole run.
+    for attempt in range(5):
+        request = urllib.request.Request(
+            WEBHOOK,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "DiscordBot (https://github.com, 1.0)",
+            },
+            method="POST",
+        )
 
-    try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            if response.status not in (200, 204):
-                raise RuntimeError(
-                    f"Discord returned HTTP {response.status}"
-                )
-    except HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        # Show Discord's error details without printing the webhook URL.
-        raise RuntimeError(
-            f"Discord HTTP {exc.code}: {details[:1000]}"
-        ) from exc
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                if response.status not in (200, 204):
+                    raise RuntimeError(
+                        f"Discord returned HTTP {response.status}"
+                    )
+                return
+        except HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
 
+            if exc.code == 429 and attempt < 4:
+                try:
+                    error_data = json.loads(details)
+                    delay = float(error_data.get("retry_after", 1))
+                except (ValueError, TypeError, AttributeError):
+                    delay = 1.0
+                time.sleep(max(0.5, min(delay, 30.0)))
+                continue
+
+            # Never print the webhook URL or other secret data.
+            raise RuntimeError(
+                f"Discord HTTP {exc.code}: {details[:1000]}"
+            ) from exc
+
+    raise RuntimeError("Discord remained rate-limited after 5 attempts.")
 
 def make_id(source, value):
     return hashlib.sha256(
