@@ -17,10 +17,16 @@ UTC = timezone.utc
 NA = "Not Available"
 
 NWS_URL = "https://api.weather.gov/alerts/active"
-EUROPE_URL = (
-    "https://feeds.meteoalarm.org/"
-    "feeds/meteoalarm-legacy-atom-europe"
-)
+METEOALARM_COUNTRIES = [
+    "andorra", "austria", "belgium", "bosnia-herzegovina", "bulgaria",
+    "croatia", "cyprus", "czechia", "denmark", "estonia", "finland",
+    "france", "germany", "greece", "hungary", "iceland", "ireland",
+    "israel", "italy", "latvia", "lithuania", "luxembourg", "malta",
+    "moldova", "montenegro", "netherlands", "republic-of-north-macedonia",
+    "norway", "poland", "portugal", "romania", "serbia", "slovakia",
+    "slovenia", "spain", "sweden", "switzerland", "ukraine",
+    "united-kingdom",
+]
 GDACS_URL = "https://www.gdacs.org/xml/rss.xml"
 
 USER_AGENT = "TeamVortexWeatherBot/3.2"
@@ -235,55 +241,75 @@ def get_nws_alerts():
 
 
 def get_europe_alerts():
-    root = ET.fromstring(fetch(EUROPE_URL))
     alerts = []
     current = now_utc()
+    successful_feeds = 0
+    feed_errors = []
 
-    for entry in root.iter():
-        if entry.tag.split("}")[-1] != "entry":
+    # MeteoAlarm provides separate Atom feeds by country, not one
+    # aggregate "Europe" feed. Check the published country feeds.
+    for country in METEOALARM_COUNTRIES:
+        url = (
+            "https://feeds.meteoalarm.org/feeds/"
+            f"meteoalarm-legacy-atom-{country}"
+        )
+        try:
+            root = ET.fromstring(fetch(url))
+            successful_feeds += 1
+        except Exception as exc:
+            feed_errors.append(f"{country}: {type(exc).__name__}")
             continue
 
-        title = child_text(entry, ["title"])
-        entry_id = child_text(entry, ["id"]) or title
-        summary = child_text(entry, ["summary", "content"])
-        onset = child_text(entry, ["onset", "effective"])
-        expires = child_text(entry, ["expires", "expiry"])
-        area = child_text(entry, ["areaDesc", "area"])
+        for entry in root.iter():
+            if entry.tag.split("}")[-1] != "entry":
+                continue
 
-        link = ""
-        for child in entry:
-            if child.tag.split("}")[-1] == "link":
-                href = child.attrib.get("href", "")
-                if href and child.attrib.get(
-                    "rel", "alternate"
-                ) in ("alternate", ""):
-                    link = href
-                    break
+            title = child_text(entry, ["title"])
+            entry_id = child_text(entry, ["id"]) or title
+            summary = child_text(entry, ["summary", "content"])
+            onset = child_text(entry, ["onset", "effective"])
+            expires = child_text(entry, ["expires", "expiry"])
+            area = child_text(entry, ["areaDesc", "area"])
 
-        expiry_dt = parse_time(expires)
-        if expiry_dt is not None and expiry_dt < current:
-            continue
+            link = ""
+            for child in entry:
+                if child.tag.split("}")[-1] == "link":
+                    href = child.attrib.get("href", "")
+                    if href and child.attrib.get(
+                        "rel", "alternate"
+                    ) in ("alternate", ""):
+                        link = href
+                        break
 
-        alerts.append({
-            "id": make_id("MeteoAlarm", entry_id or title),
-            "source": "MeteoAlarm Europe",
-            "event": available(title),
-            "headline": available(summary),
-            "description": available(summary),
-            "area": available(area),
-            "severity": available(
-                child_text(entry, ["severity", "awareness_level"])
-            ),
-            "urgency": available(child_text(entry, ["urgency"])),
-            "certainty": available(child_text(entry, ["certainty"])),
-            "start": onset or child_text(entry, ["updated", "published"]),
-            "end": expires,
-            "url": available(link) if link else NA,
-            "kind": "weather",
-        })
+            expiry_dt = parse_time(expires)
+            if expiry_dt is not None and expiry_dt < current:
+                continue
+
+            alerts.append({
+                "id": make_id("MeteoAlarm", entry_id or title),
+                "source": "MeteoAlarm Europe",
+                "event": available(title),
+                "headline": available(summary),
+                "description": available(summary),
+                "area": available(area),
+                "severity": available(
+                    child_text(entry, ["severity", "awareness_level"])
+                ),
+                "urgency": available(child_text(entry, ["urgency"])),
+                "certainty": available(child_text(entry, ["certainty"])),
+                "start": onset or child_text(entry, ["updated", "published"]),
+                "end": expires,
+                "url": available(link) if link else NA,
+                "kind": "weather",
+            })
+
+    if successful_feeds == 0:
+        raise RuntimeError(
+            "All MeteoAlarm country feeds failed: "
+            + ", ".join(feed_errors[:8])
+        )
 
     return alerts
-
 
 def get_gdacs_events():
     root = ET.fromstring(fetch(GDACS_URL))
