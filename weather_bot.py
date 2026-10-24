@@ -160,7 +160,10 @@ def post_discord(message):
     request = urllib.request.Request(
         WEBHOOK,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (https://github.com, 1.0)",
+        },
         method="POST",
     )
 
