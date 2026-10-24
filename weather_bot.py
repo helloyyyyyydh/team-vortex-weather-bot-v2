@@ -556,7 +556,7 @@ def format_alert(alert):
         f"**Official alert data (JSON):** {available(alert.get('url'))}\n"
         + (
             f"**Readable NWS page for affected area:** {available(alert.get('human_url'))}\n"
-            if alert.get("source") == "U.S. National Weather Service"
+            if "U.S. National Weather Service" in available(alert.get("source"))
             else ""
         )
         + f"**Bot check time:** {display_time(now_utc(), include_timezone=False)}"
