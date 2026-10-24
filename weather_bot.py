@@ -134,6 +134,7 @@ def load_state():
     state.setdefault("seen", [])
     state.setdefault("last_hourly_test", "")
     state.setdefault("baseline_saved", False)
+    state.setdefault("last_top_ten", [])
 
     if not isinstance(state["seen"], list):
         raise RuntimeError("Invalid alert history in bot_state.json.")
@@ -508,8 +509,9 @@ def main():
         # are posted, so five-minute polling does not repeat alerts.
         ranked = sorted(all_items, key=lambda x: (danger_score(x), x.get("event", "")))
         top_ten = ranked[-10:]
-        new_ids = {x["id"] for x in all_items if x["id"] not in seen}
-        selected = [x for x in top_ten if x["id"] in new_ids]
+        previous_top = set(state.get("last_top_ten", []))
+        selected = [x for x in top_ten if x["id"] not in previous_top]
+        state["last_top_ten"] = [x["id"] for x in top_ten]
 
         # Mark all discovered entries seen, including entries outside the top
         # ten, so a large feed backlog never floods later checks.
