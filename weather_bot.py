@@ -231,6 +231,25 @@ def get_nws_alerts():
 
     for feature in data.get("features", []):
         p = feature.get("properties") or {}
+
+        # Filter diagnostic, test, and non-public NWS records.
+        status = str(p.get("status") or "").strip().lower()
+        scope = str(p.get("scope") or "").strip().lower()
+        message_type = str(p.get("messageType") or "").strip().lower()
+        event_name = str(p.get("event") or "").strip().lower()
+        feature_id = str(feature.get("id") or p.get("id") or "")
+
+        if status and status != "actual":
+            continue
+        if scope and scope != "public":
+            continue
+        if message_type and message_type not in {"alert", "update", "cancel"}:
+            continue
+        if "keepalive" in feature_id.lower() or event_name in {
+            "test message", "system message", "test",
+        }:
+            continue
+
         source_id = (
             feature.get("id")
             or p.get("id")
@@ -249,7 +268,9 @@ def get_nws_alerts():
             "certainty": available(p.get("certainty")),
             "start": p.get("onset") or p.get("effective"),
             "end": p.get("ends") or p.get("expires"),
+            # API links return JSON; provide a readable NWS website too.
             "url": available(feature.get("id")),
+            "human_url": "https://www.weather.gov/",
             "kind": "weather",
         })
 
@@ -382,8 +403,13 @@ def format_alert(alert):
         f"**Start / issued:** {display_time(alert.get('start'))}\n"
         f"**End / expires:** {display_time(alert.get('end'))}\n"
         f"**Details:** {details}\n"
-        f"**Track it:** {available(alert.get('url'))}\n"
-        f"**Bot check time:** {display_time(now_utc())}"
+        f"**Official alert data (JSON):** {available(alert.get('url'))}\n"
+        + (
+            f"**Readable NWS site:** {available(alert.get('human_url'))}\n"
+            if alert.get("source") == "U.S. National Weather Service"
+            else ""
+        )
+        + f"**Bot check time:** {display_time(now_utc())}"
     )
 
 
