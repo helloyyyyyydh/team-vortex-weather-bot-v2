@@ -134,7 +134,6 @@ def load_state():
     state.setdefault("seen", [])
     state.setdefault("last_hourly_test", "")
     state.setdefault("baseline_saved", False)
-    state.setdefault("last_top_ten", [])
 
     if not isinstance(state["seen"], list):
         raise RuntimeError("Invalid alert history in bot_state.json.")
@@ -361,34 +360,6 @@ def get_gdacs_events():
     return events
 
 
-def danger_score(alert):
-    """Heuristic ranking: low routine notices first, highest risk last."""
-    text = " ".join(str(alert.get(k, "")) for k in
-                    ("event", "headline", "description")).lower()
-    severity = str(alert.get("severity", "")).lower()
-    urgency = str(alert.get("urgency", "")).lower()
-    score = {"extreme": 50, "severe": 40, "moderate": 25,
-             "minor": 10, "unknown": 5}.get(severity, 0)
-    score += {"immediate": 20, "expected": 12, "future": 5}.get(urgency, 0)
-    tiers = [
-        (65, ("tornado emergency", "tsunami warning", "flash flood emergency")),
-        (55, ("tornado warning", "hurricane warning", "storm surge warning",
-              "flash flood warning", "red warning", "red alert")),
-        (40, ("severe thunderstorm warning", "blizzard warning",
-              "ice storm warning", "wildfire warning", "orange warning")),
-        (25, ("flood warning", "extreme heat warning", "high wind warning",
-              "winter storm warning", "yellow warning")),
-        (12, ("watch", "advisory")),
-    ]
-    for points, phrases in tiers:
-        if any(p in text for p in phrases):
-            score += points
-            break
-    if "gdacs" in str(alert.get("source", "")).lower():
-        score += 45 if "red" in text else 30 if "orange" in text else 10 if "green" in text else 0
-    return score
-
-
 def format_alert(alert):
     details = available(
         alert.get("headline")
@@ -401,15 +372,8 @@ def format_alert(alert):
         if len(details) > 600:
             details = details[:597] + "..."
 
-    kind = (
-        "Global disaster event"
-        if alert["kind"] == "disaster"
-        else "Weather warning / watch / advisory"
-    )
-
     return (
         f"🚨 **{available(alert.get('event'))}**\n"
-        f"**Type:** {kind}\n"
         f"**Source:** {available(alert.get('source'))}\n"
         f"**Location:** {available(alert.get('area'))}\n"
         f"**Severity:** {available(alert.get('severity'))}\n"
@@ -504,17 +468,12 @@ def main():
             f"**Time:** {display_time(now_utc())}"
         )
     else:
-        # Rank all currently reported entries, select the ten highest-risk,
-        # then post those from lower to higher danger. Only unseen entries
-        # are posted, so five-minute polling does not repeat alerts.
-        ranked = sorted(all_items, key=lambda x: (danger_score(x), x.get("event", "")))
-        top_ten = ranked[-10:]
-        previous_top = set(state.get("last_top_ten", []))
-        selected = [x for x in top_ten if x["id"] not in previous_top]
-        state["last_top_ten"] = [x["id"] for x in top_ten]
+        # Post only newly discovered entries, with a hard cap to prevent
+        # feed backlogs from flooding Discord.
+        selected = [item for item in all_items if item["id"] not in seen][:10]
 
-        # Mark all discovered entries seen, including entries outside the top
-        # ten, so a large feed backlog never floods later checks.
+        # Mark all discovered entries seen, including entries beyond the cap,
+        # so a large feed backlog never floods later checks.
         for item in all_items:
             if item["id"] not in seen:
                 state["seen"].append(item["id"])
@@ -522,11 +481,8 @@ def main():
         state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN:]
         save_state(state)
 
-        for item in reversed(selected):
-            post_discord(
-                f"**Danger ranking:** {danger_score(item)} (higher = more urgent)\\n"
-                + format_alert(item)
-            )
+        for item in selected:
+            post_discord(format_alert(item))
 
     # Keep status summaries to one concise message per check.
     if len(successful_weather_feeds) == 2:
