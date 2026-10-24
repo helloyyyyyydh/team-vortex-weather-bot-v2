@@ -426,7 +426,6 @@ def main():
     now = now_utc()
 
     # Only announce a startup for a manual workflow run.
-    # Scheduled five-minute checks do not post startup messages.
     if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
         post_discord(
             "🟢 **Team Vortex Weather Bot has been manually started!**\n"
@@ -445,74 +444,88 @@ def main():
     ]:
         try:
             items = getter()
-
             if category == "weather":
                 successful_weather_feeds.append(name)
                 active_weather.extend(items)
             else:
                 disaster_events.extend(items)
-
         except Exception as exc:
             failed_feeds.append(
                 f"{name}: {type(exc).__name__}: {str(exc)[:180]}"
             )
 
-    seen = set(state["seen"])
     all_items = active_weather + disaster_events
-    new_items = [item for item in all_items if item["id"] not in seen]
+    seen = set(state["seen"])
 
+    # On the first successful run, establish a baseline without posting
+    # every historical alert into Discord.
     if not state["baseline_saved"]:
         state["seen"] = list(dict.fromkeys(
             item["id"] for item in all_items
         ))[-MAX_SEEN:]
         state["baseline_saved"] = True
-
+        save_state(state)
         post_discord(
             "🧭 **Initial alert history created.**\n"
-            "Existing feed entries were recorded to reduce duplicate spam. "
-            "Newly detected entries will be posted on later checks.\n"
+            "Existing feed entries were recorded silently to prevent a "
+            "flood of old alerts. Newly detected alerts will be posted "
+            "on later checks.\n"
             f"**Weather feeds working:** "
             f"{', '.join(successful_weather_feeds) or NA}\n"
             f"**Time:** {display_time(now_utc())}"
         )
     else:
-        for item in new_items:
+        # Only post alerts that are genuinely new. Cap each run so a feed
+        # refresh or provider change cannot flood the Discord channel.
+        new_items = [item for item in all_items if item["id"] not in seen]
+        max_alerts_per_run = 5
+        for item in new_items[:max_alerts_per_run]:
             post_discord(format_alert(item))
             state["seen"].append(item["id"])
+            seen.add(item["id"])
 
+        # Record the rest as seen without posting them, preventing the same
+        # backlog from being dumped into the channel on every five-minute run.
+        for item in new_items[max_alerts_per_run:]:
+            state["seen"].append(item["id"])
+        if new_items:
+            state["seen"] = list(dict.fromkeys(state["seen"]))[-MAX_SEEN:]
+            save_state(state)
+        if len(new_items) > max_alerts_per_run:
+            post_discord(
+                f"ℹ️ **Alert flood protection:** {max_alerts_per_run} new "
+                "alerts were posted this check. Additional newly detected "
+                "entries were suppressed to keep the channel usable."
+            )
+
+    # Keep status summaries to one concise message per check.
     if len(successful_weather_feeds) == 2:
         if active_weather:
-            post_discord(
+            status = (
                 "📋 **Active weather alerts listed in monitored feeds**\n"
                 f"**Count:** {len(active_weather)}\n"
-                f"**Sources checked:** {', '.join(successful_weather_feeds)}\n"
-                "Previously seen alerts are not repeated as new alerts.\n"
-                f"**Checked:** {display_time(now_utc())}"
+                f"**Sources checked:** {', '.join(successful_weather_feeds)}"
             )
         else:
-            post_discord(
+            status = (
                 "✅ **No active weather alerts were listed in the monitored "
                 "feeds at this check.**\n"
                 f"**Sources checked:** {', '.join(successful_weather_feeds)}\n"
-                "This does not guarantee that no alerts exist worldwide.\n"
-                f"**Checked:** {display_time(now_utc())}"
+                "This does not guarantee that no alerts exist worldwide."
             )
     else:
-        post_discord(
+        status = (
             "⚠️ **Active-alert status could not be fully confirmed.**\n"
             f"**Weather feeds that worked:** "
             f"{', '.join(successful_weather_feeds) or NA}\n"
-            "At least one monitored weather feed failed. A global all-clear "
-            "message would be unreliable.\n"
-            f"**Checked:** {display_time(now_utc())}"
+            "At least one monitored weather feed failed; a full all-clear "
+            "would be unreliable."
         )
 
     if failed_feeds:
-        post_discord(
-            "⚠️ **Some sources could not be checked:**\n"
-            + "\n".join(f"• {failure}" for failure in failed_feeds)
-            + f"\n**Time:** {display_time(now_utc())}"
-        )
+        status += "\n**Sources with errors:** " + "; ".join(failed_feeds[:3])
+    status += f"\n**Checked:** {display_time(now_utc())}"
+    post_discord(status)
 
     try:
         send_hourly_fake_test(state)
@@ -520,12 +533,11 @@ def main():
         print(f"Hourly fake test could not be sent: {exc}")
 
     save_state(state)
-
     print(f"Check finished: {now.isoformat()}")
     print(f"Weather feeds working: {successful_weather_feeds}")
-    print(f"Failed feeds: {failed_feeds}")
-    print(f"Weather alerts listed: {len(active_weather)}")
-    print(f"Global disaster events listed: {len(disaster_events)}")
+    print(f"New entries found: {len(all_items)}")
+    if failed_feeds:
+        print("Feed errors: " + " | ".join(failed_feeds))
 
 
 if __name__ == "__main__":
