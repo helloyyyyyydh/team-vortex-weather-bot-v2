@@ -319,6 +319,45 @@ def readable_nws_url(feature):
     )
 
 
+def alert_center(feature):
+    """Return a representative longitude/latitude from NWS GeoJSON geometry."""
+    geometry = feature.get("geometry") or {}
+    points = []
+    def walk(value):
+        if isinstance(value, (list, tuple)) and len(value) >= 2 and isinstance(value[0], (int, float)) and isinstance(value[1], (int, float)):
+            points.append((float(value[0]), float(value[1])))
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                walk(child)
+    walk(geometry.get("coordinates"))
+    if not points:
+        return None
+    lon = sum(p[0] for p in points) / len(points)
+    lat = sum(p[1] for p in points) / len(points)
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        return None
+    return lat, lon
+
+
+def satellite_image(feature):
+    """Fetch overhead satellite imagery around the NWS alert area."""
+    center = alert_center(feature)
+    if center is None:
+        return None
+    import math
+    lat, lon = center
+    half_lat = 0.22
+    half_lon = min(0.35, half_lat / max(0.25, abs(math.cos(math.radians(lat)))))
+    bbox = f"{lon-half_lon:.5f},{lat-half_lat:.5f},{lon+half_lon:.5f},{lat+half_lat:.5f}"
+    url = ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+           f"?bbox={bbox}&bboxSR=4326&imageSR=4326&size=900,600&format=jpg&f=image")
+    try:
+        image_data = fetch(url, "image/jpeg")
+        return image_data if image_data.startswith(bytes((255, 216, 255))) else None
+    except Exception as exc:
+        print(f"Satellite image unavailable: {type(exc).__name__}")
+        return None
+
 def get_nws_alerts():
     data = json.loads(fetch(
         NWS_URL,
@@ -370,6 +409,7 @@ def get_nws_alerts():
             # the NWS forecast page at a point within the alert geometry.
             "url": available(feature.get("id")),
             "human_url": readable_nws_url(feature),
+            "satellite_image": satellite_image(feature),
             "kind": "weather",
         })
 
